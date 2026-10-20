@@ -238,11 +238,53 @@ impl<'a> UntypedIter<'a> {
                     let stream_data = self.reader.tail()?;
                     let start_offset = self.reader.offset();
                     let mut candidates = 0;
+                    // PdfCraft patch: the byte length an uncompressed inline image's data must
+                    // have, when it can be known from the dictionary. Any "EI" found strictly
+                    // inside that many bytes is certainly part of the image data (binary scans
+                    // often contain one), so it is skipped instead of ending the image early.
+                    let min_data_len = inline_data_len(inline_dict.get_dict());
                     // PdfCraft patch: set when a look-ahead below ran into the end of the window.
                     let mut lookahead_touched = false;
                     let mut accepted = false;
 
                     'outer: while let Some(pos) = find_needle(self.reader.tail()?, b"EI") {
+                        // PdfCraft patch: when the data length is known and this "EI" sits exactly
+                        // at its end (a trailing whitespace byte aside), the image data is complete
+                        // for certain: accept it without the look-ahead heuristics below, which can
+                        // be fooled by "EI" sequences inside the content that follows the image.
+                        let base = self.reader.offset() - start_offset;
+                        let abs_pos = base + pos;
+                        if min_data_len == Some(abs_pos)
+                            || min_data_len == Some(abs_pos.saturating_sub(1))
+                                && pos >= 1
+                                && stream_data[abs_pos - 1].is_ascii_whitespace()
+                                && stream_data.get(abs_pos..abs_pos + 2) == Some(&b"EI"[..])
+                        {
+                            self.reader.read_bytes(pos)?;
+                            self.reader.read_bytes(2)?;
+                            self.reader.skip_white_spaces();
+                            self.stack.push(Object::Stream(Stream::new(
+                                &stream_data[..abs_pos],
+                                dict.clone(),
+                            )))?;
+                            self.operator = Some(operator);
+                            self.committed = self.reader.offset();
+                            return Some(Instruction {
+                                operands: &self.stack,
+                                operator: self.operator.as_ref().unwrap(),
+                            });
+                        }
+
+                        if let Some(expected) = min_data_len {
+                            // Only skip "EI" sequences that lie well inside the expected data; a
+                            // candidate near the expected end may be the true end of shorter,
+                            // malformed data.
+                            if abs_pos + 8 < expected {
+                                self.reader.read_bytes(pos + 2)?;
+                                continue;
+                            }
+                        }
+
                         self.reader.read_bytes(pos)?;
 
                         if self.reader.peek_bytes(2) == Some(b"EI") {
@@ -929,7 +971,7 @@ mod tests {
 
     /// Content whose instructions are hard to read in pieces: inline images with `EI` in their
     /// data or right after it, unterminated tokens, and operands that are too many or invalid.
-    const WINDOWED_CORPUS: [&[u8]; 14] = [
+    const WINDOWED_CORPUS: [&[u8]; 15] = [
         b"% comment\n1 -2.5 /Name /A#20B (a\\(b\\) \\101) <4869> [1 2] << /Key (value) >> [(a) 1] TJ BI /W 1 /H 1 /BPC 8 /CS /DeviceGray ID \x00 EI q Q",
         b"BT /F1 12 Tf 10 20 Td [(Hel) -250 (lo)] TJ (x) Tj ET",
         b"q 1 0 0 1 0 0 cm BI /W 2 /H 2 /BPC 8 /CS /G ID \x00\x01EI\x00 EI Q 0 0 m 1 1 l S",
@@ -941,6 +983,9 @@ mod tests {
         b"1 0 0 1 0 0 cm\n%comment at the end",
         b"BI /W 1 /H 1 /BPC 8 /CS /G ID \x00 EIxy q",
         b"BI /W 2 /H 1 /BPC 8 /CS /G ID \x00\x01 EI \x00 EI \x01 q",
+        // PdfCraft patch: the image data itself contains "EI"; the known data length must win
+        // over the look-ahead heuristics, which would otherwise end the image early.
+        b"BI /W 4 /H 1 /BPC 8 /CS /G ID \x00EI\x00\x00 EI q",
         b"[1 [2 [3]]] 0 d q Q",
         b"/Lbl BDC EMC 1 w",
         b"<</A 1>> BDC BI /W 1 /H 1 /BPC 8 /CS /G ID \x07 EI (end) Tj",
@@ -1014,4 +1059,31 @@ mod tests {
             assert_eq!(windowed, expected, "{:?}", String::from_utf8_lossy(&data));
         }
     }
+}
+
+/// PdfCraft patch: the exact byte length of an inline image's data, when the image is
+/// uncompressed and its dimensions, bit depth and component count are known. `None` when any
+/// of those is missing or a filter makes the encoded length unknowable. Rows are padded to
+/// whole bytes (ISO 32000-2 §8.9.7.2).
+fn inline_data_len(dict: &crate::object::Dict<'_>) -> Option<usize> {
+    if dict.get::<Object<'_>>(b"F").is_some() {
+        return None;
+    }
+    let width = dict.get::<u32>(b"W")? as usize;
+    let height = dict.get::<u32>(b"H")? as usize;
+    let bpc = dict.get::<u8>(b"BPC")? as usize;
+    if width == 0 || height == 0 || bpc == 0 || bpc > 16 {
+        return None;
+    }
+    let components = if dict.get::<bool>(b"IM").unwrap_or(false) {
+        1
+    } else {
+        match dict.get::<crate::object::Name<'_>>(b"CS")?.deref() {
+            b"G" | b"DeviceGray" => 1,
+            b"RGB" | b"DeviceRGB" => 3,
+            b"CMYK" | b"DeviceCMYK" => 4,
+            _ => return None,
+        }
+    };
+    Some(((width * bpc * components) + 7) / 8 * height)
 }

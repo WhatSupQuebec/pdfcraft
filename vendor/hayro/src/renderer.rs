@@ -1447,11 +1447,27 @@ impl<'a> Device<'a> for Renderer {
         match image {
             hayro_interpret::Image::Stencil(s) => {
                 s.with_stencil(
-                    |stencil, paint| {
+                    |mut stencil, paint| {
                         transform *= Affine::scale_non_uniform(
                             stencil.scale_factors.0 as f64,
                             stencil.scale_factors.1 as f64,
                         );
+
+                        // PdfCraft patch: a minified stencil mask (a 1-bpc scan, usually) loses
+                        // its thin strokes to nearest-neighbour sampling, which picks single
+                        // samples and drops every line narrower than the sampling step. Filter it
+                        // like an interpolated image instead, so minification blends coverage and
+                        // the scan stays readable. Upscaling and 1:1 draws are unaffected.
+                        let [a, b, c, d, _, _] = transform.as_coeffs();
+                        let x_scale = (a * a + b * b).sqrt();
+                        let y_scale = (c * c + d * d).sqrt();
+                        if stencil.scale_factors.0 <= 1.0
+                            && stencil.scale_factors.1 <= 1.0
+                            && x_scale < 1.0
+                            && y_scale < 1.0
+                        {
+                            stencil.interpolate = true;
+                        }
 
                         // PdfCraft patch: a stencil mask is line art in disguise, so its solid
                         // paint goes through the reading-colours mapping (line-art gate) like

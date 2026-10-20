@@ -896,7 +896,7 @@ mod macros {
 
 #[cfg(test)]
 mod tests {
-    use super::{ContentTokenizer, UntypedIter};
+    use super::{ContentTokenizer, Object, UntypedIter};
 
     fn operators(data: &[u8]) -> Vec<Vec<u8>> {
         let mut tokenizer = UntypedIter::new(data);
@@ -1059,14 +1059,54 @@ mod tests {
             assert_eq!(windowed, expected, "{:?}", String::from_utf8_lossy(&data));
         }
     }
+
+    #[test]
+    fn known_inline_image_length_skips_embedded_ei() {
+        let mut image_data = vec![0; 24];
+        image_data[1..3].copy_from_slice(b"EI");
+        image_data[23] = b' ';
+        let mut data = b"BI /W 24 /H 1 /BPC 8 /CS /G ID ".to_vec();
+        data.extend_from_slice(&image_data);
+        data.extend_from_slice(b"EI q");
+
+        let mut tokenizer = UntypedIter::new(&data);
+        let instruction = tokenizer.next().expect("inline image instruction");
+        assert_eq!(instruction.operator.as_ref(), b"BI");
+        let stream = instruction
+            .operands()
+            .find_map(|operand| match operand {
+                Object::Stream(stream) => Some(stream),
+                _ => None,
+            })
+            .expect("inline image stream operand");
+        assert_eq!(stream.raw_data().as_ref(), image_data.as_slice());
+    }
+
+    #[test]
+    fn full_filter_key_does_not_use_uncompressed_inline_image_length() {
+        let data = b"BI /W 24 /H 1 /BPC 8 /CS /G /Filter /FlateDecode ID \x00 EI q";
+        let mut tokenizer = UntypedIter::new(data);
+        let instruction = tokenizer.next().expect("inline image instruction");
+        assert_eq!(instruction.operator.as_ref(), b"BI");
+        let stream = instruction
+            .operands()
+            .find_map(|operand| match operand {
+                Object::Stream(stream) => Some(stream),
+                _ => None,
+            })
+            .expect("inline image stream operand");
+        assert_eq!(stream.raw_data().as_ref(), b"\x00 ");
+    }
 }
 
 /// PdfCraft patch: the exact byte length of an inline image's data, when the image is
 /// uncompressed and its dimensions, bit depth and component count are known. `None` when any
 /// of those is missing or a filter makes the encoded length unknowable. Rows are padded to
 /// whole bytes (ISO 32000-2 §8.9.7.2).
-fn inline_data_len(dict: &crate::object::Dict<'_>) -> Option<usize> {
-    if dict.get::<Object<'_>>(b"F").is_some() {
+fn inline_data_len(dict: &object::Dict<'_>) -> Option<usize> {
+    if dict.get::<Object<'_>>(b"F").is_some()
+        || dict.get::<Object<'_>>(b"Filter").is_some()
+    {
         return None;
     }
     let width = dict.get::<u32>(b"W")? as usize;
@@ -1078,12 +1118,13 @@ fn inline_data_len(dict: &crate::object::Dict<'_>) -> Option<usize> {
     let components = if dict.get::<bool>(b"IM").unwrap_or(false) {
         1
     } else {
-        match dict.get::<crate::object::Name<'_>>(b"CS")?.deref() {
+        match dict.get::<Name<'_>>(b"CS")?.deref() {
             b"G" | b"DeviceGray" => 1,
             b"RGB" | b"DeviceRGB" => 3,
             b"CMYK" | b"DeviceCMYK" => 4,
             _ => return None,
         }
     };
-    Some(((width * bpc * components) + 7) / 8 * height)
+    let row_bits = width.checked_mul(bpc)?.checked_mul(components)?;
+    row_bits.div_ceil(8).checked_mul(height)
 }

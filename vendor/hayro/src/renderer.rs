@@ -1461,11 +1461,7 @@ impl<'a> Device<'a> for Renderer {
                         let [a, b, c, d, _, _] = transform.as_coeffs();
                         let x_scale = (a * a + b * b).sqrt();
                         let y_scale = (c * c + d * d).sqrt();
-                        if stencil.scale_factors.0 <= 1.0
-                            && stencil.scale_factors.1 <= 1.0
-                            && x_scale < 1.0
-                            && y_scale < 1.0
-                        {
+                        if x_scale < 1.0 || y_scale < 1.0 {
                             stencil.interpolate = true;
                         }
 

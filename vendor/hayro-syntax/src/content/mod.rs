@@ -259,18 +259,21 @@ impl<'a> UntypedIter<'a> {
                     // when the expected end holds no such "EI", the scan below runs as before,
                     // which keeps shorter, malformed data working.
                     if let Some(expected) = min_data_len {
-                        let after_ei = if stream_data.get(expected..expected + 2) == Some(&b"EI"[..])
-                        {
-                            Some(expected + 2)
-                        } else if stream_data
-                            .get(expected)
-                            .is_some_and(|b| is_white_space_character(*b))
-                            && stream_data.get(expected + 1..expected + 3) == Some(&b"EI"[..])
-                        {
-                            Some(expected + 3)
-                        } else {
-                            None
-                        };
+                        // PdfCraft patch: the offsets below are checked — a length computed from
+                        // absurd dimensions can approach usize::MAX, and `expected + 2` would
+                        // panic in an overflow-checked build instead of failing the `get`. Such
+                        // a length cannot fit any window, so it decides nothing here.
+                        let after_ei = expected.checked_add(2).and_then(|after| {
+                            (stream_data.get(expected..after) == Some(&b"EI"[..])).then_some(after)
+                        })
+                        .or_else(|| {
+                            expected.checked_add(3).and_then(|after| {
+                                (stream_data.get(expected)
+                                    .is_some_and(|b| is_white_space_character(*b))
+                                    && stream_data.get(expected + 1..after) == Some(&b"EI"[..]))
+                                .then_some(after)
+                            })
+                        });
                         let certain = after_ei.is_some_and(|after| match stream_data.get(after) {
                             Some(b) => is_white_space_character(*b),
                             None => self.complete,
@@ -1236,6 +1239,17 @@ mod tests {
             })
             .expect("inline image stream operand");
         assert_eq!(stream.raw_data().as_ref(), b"\x00EI\x00 ");
+    }
+
+    #[test]
+    fn an_absurd_declared_length_does_not_overflow_the_window_check() {
+        // The computed length of these dimensions is usize::MAX - 1; the window check at the
+        // expected end must refuse it with checked offsets instead of panicking on
+        // `expected + 2` in an overflow-checked build (a native debug build panicked).
+        let data = b"BI /W 2281422937 /H 4042815511 /BPC 16 /CS /G ID x EI Q";
+        let mut tokenizer = UntypedIter::new_window(data, false);
+        assert!(tokenizer.next().is_none(), "an incomplete window decides nothing");
+        assert!(tokenizer.needs_more);
     }
 }
 

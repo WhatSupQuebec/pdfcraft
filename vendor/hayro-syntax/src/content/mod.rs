@@ -242,7 +242,11 @@ impl<'a> UntypedIter<'a> {
                     // have, when it can be known from the dictionary. Any "EI" found strictly
                     // inside that many bytes is certainly part of the image data (binary scans
                     // often contain one), so it is skipped instead of ending the image early.
-                    let min_data_len = inline_data_len(inline_dict.get_dict());
+                    // A declared length that cannot fit the window is a producer's mistake (or
+                    // written to waste work): honouring it would skip every "EI" and never
+                    // terminate the image, so it is ignored and the scan decides as before.
+                    let min_data_len =
+                        inline_data_len(inline_dict.get_dict()).filter(|n| !self.complete || *n <= stream_data.len());
                     // PdfCraft patch: set when a look-ahead below ran into the end of the window.
                     let mut lookahead_touched = false;
                     let mut accepted = false;
@@ -1213,6 +1217,25 @@ mod tests {
             })
             .expect("inline image stream operand");
         assert_eq!(stream.raw_data().as_ref(), b"aEIbbbbb");
+    }
+
+    #[test]
+    fn a_declared_length_that_cannot_fit_the_stream_is_ignored() {
+        // A complete stream whose /L is far larger than the data present: honouring it would
+        // skip every "EI" and never terminate the image, so the length is ignored and the
+        // image ends at its real "EI" as it did before the length shortcut existed.
+        let data = b"BI /W 4 /H 1 /BPC 8 /CS /G /L 1000000 ID \x00EI\x00 EI q";
+        let mut tokenizer = UntypedIter::new(data);
+        let instruction = tokenizer.next().expect("inline image instruction");
+        assert_eq!(instruction.operator.as_ref(), b"BI");
+        let stream = instruction
+            .operands()
+            .find_map(|operand| match operand {
+                Object::Stream(stream) => Some(stream),
+                _ => None,
+            })
+            .expect("inline image stream operand");
+        assert_eq!(stream.raw_data().as_ref(), b"\x00EI\x00 ");
     }
 }
 

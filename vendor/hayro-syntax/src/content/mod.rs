@@ -247,24 +247,35 @@ impl<'a> UntypedIter<'a> {
                     let mut lookahead_touched = false;
                     let mut accepted = false;
 
-                    'outer: while let Some(pos) = find_needle(self.reader.tail()?, b"EI") {
-                        // PdfCraft patch: when the data length is known and this "EI" sits exactly
-                        // at its end (a trailing whitespace byte aside), the image data is complete
-                        // for certain: accept it without the look-ahead heuristics below, which can
-                        // be fooled by "EI" sequences inside the content that follows the image.
-                        let base = self.reader.offset() - start_offset;
-                        let abs_pos = base + pos;
-                        if min_data_len == Some(abs_pos)
-                            || min_data_len == Some(abs_pos.saturating_sub(1))
-                                && pos >= 1
-                                && stream_data[abs_pos - 1].is_ascii_whitespace()
-                                && stream_data.get(abs_pos..abs_pos + 2) == Some(&b"EI"[..])
+                    // PdfCraft patch: when the data length is known, the bytes at the expected end
+                    // decide the image outright: an optional single whitespace byte, then "EI",
+                    // then a whitespace byte (or the end of a complete window). Deciding there
+                    // keeps an "EI" inside the data from reaching the look-ahead heuristics, which
+                    // content after the image can fool before the scan ever reaches the true end;
+                    // when the expected end holds no such "EI", the scan below runs as before,
+                    // which keeps shorter, malformed data working.
+                    if let Some(expected) = min_data_len {
+                        let after_ei = if stream_data.get(expected..expected + 2) == Some(&b"EI"[..])
                         {
-                            self.reader.read_bytes(pos)?;
-                            self.reader.read_bytes(2)?;
+                            Some(expected + 2)
+                        } else if stream_data
+                            .get(expected)
+                            .is_some_and(|b| is_white_space_character(*b))
+                            && stream_data.get(expected + 1..expected + 3) == Some(&b"EI"[..])
+                        {
+                            Some(expected + 3)
+                        } else {
+                            None
+                        };
+                        let certain = after_ei.is_some_and(|after| match stream_data.get(after) {
+                            Some(b) => is_white_space_character(*b),
+                            None => self.complete,
+                        });
+                        if let Some(after) = after_ei.filter(|_| certain) {
+                            self.reader.read_bytes(after)?;
                             self.reader.skip_white_spaces();
                             self.stack.push(Object::Stream(Stream::new(
-                                &stream_data[..abs_pos],
+                                &stream_data[..expected],
                                 dict.clone(),
                             )))?;
                             self.operator = Some(operator);
@@ -274,6 +285,11 @@ impl<'a> UntypedIter<'a> {
                                 operator: self.operator.as_ref().unwrap(),
                             });
                         }
+                    }
+
+                    'outer: while let Some(pos) = find_needle(self.reader.tail()?, b"EI") {
+                        let base = self.reader.offset() - start_offset;
+                        let abs_pos = base + pos;
 
                         if let Some(expected) = min_data_len {
                             // Only skip "EI" sequences that lie well inside the expected data; a
@@ -971,7 +987,7 @@ mod tests {
 
     /// Content whose instructions are hard to read in pieces: inline images with `EI` in their
     /// data or right after it, unterminated tokens, and operands that are too many or invalid.
-    const WINDOWED_CORPUS: [&[u8]; 15] = [
+    const WINDOWED_CORPUS: [&[u8]; 16] = [
         b"% comment\n1 -2.5 /Name /A#20B (a\\(b\\) \\101) <4869> [1 2] << /Key (value) >> [(a) 1] TJ BI /W 1 /H 1 /BPC 8 /CS /DeviceGray ID \x00 EI q Q",
         b"BT /F1 12 Tf 10 20 Td [(Hel) -250 (lo)] TJ (x) Tj ET",
         b"q 1 0 0 1 0 0 cm BI /W 2 /H 2 /BPC 8 /CS /G ID \x00\x01EI\x00 EI Q 0 0 m 1 1 l S",
@@ -986,6 +1002,9 @@ mod tests {
         // PdfCraft patch: the image data itself contains "EI"; the known data length must win
         // over the look-ahead heuristics, which would otherwise end the image early.
         b"BI /W 4 /H 1 /BPC 8 /CS /G ID \x00EI\x00\x00 EI q",
+        // PdfCraft patch: the "EI" in the last three data bytes is close to the expected end,
+        // so the well-inside skip does not apply and the heuristics would take it for the end.
+        b"BI /W 16 /H 1 /BPC 8 /CS /G ID \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00 EI EI q",
         b"[1 [2 [3]]] 0 d q Q",
         b"/Lbl BDC EMC 1 w",
         b"<</A 1>> BDC BI /W 1 /H 1 /BPC 8 /CS /G ID \x07 EI (end) Tj",
@@ -1097,28 +1116,146 @@ mod tests {
             .expect("inline image stream operand");
         assert_eq!(stream.raw_data().as_ref(), b"\x00 ");
     }
+
+    #[test]
+    fn known_length_end_inside_the_data_wins_over_the_look_ahead() {
+        // The data's last three bytes are " EI" and the real "EI" follows one whitespace
+        // later: the look-ahead heuristics would end the image at the in-data "EI" before
+        // the scan ever reaches the true end.
+        let mut image_data = vec![0; 16];
+        image_data[13..16].copy_from_slice(b" EI");
+        let mut data = b"BI /W 16 /H 1 /BPC 8 /CS /G ID ".to_vec();
+        data.extend_from_slice(&image_data);
+        data.extend_from_slice(b" EI q");
+
+        let mut tokenizer = UntypedIter::new(&data);
+        let instruction = tokenizer.next().expect("inline image instruction");
+        assert_eq!(instruction.operator.as_ref(), b"BI");
+        let stream = instruction
+            .operands()
+            .find_map(|operand| match operand {
+                Object::Stream(stream) => Some(stream),
+                _ => None,
+            })
+            .expect("inline image stream operand");
+        assert_eq!(stream.raw_data().as_ref(), image_data.as_slice());
+        assert_eq!(tokenizer.next().map(|i| i.operator.as_ref()), Some(&b"q"[..]));
+    }
+
+    #[test]
+    fn known_length_end_without_a_delimiter_falls_back_to_the_heuristics() {
+        // The declared length ends at an "EI" that is followed by "xy" instead of a
+        // delimiter: the shortcut must not accept it, and nothing is pushed for the image.
+        let data = b"BI /W 3 /H 1 /BPC 8 /CS /G ID \x00EIxy q";
+        let mut tokenizer = UntypedIter::new(data);
+        let instruction = tokenizer.next().expect("inline image instruction");
+        assert_eq!(instruction.operator.as_ref(), b"BI");
+        assert!(instruction
+            .operands()
+            .find_map(|operand| match operand {
+                Object::Stream(_) => Some(()),
+                _ => None,
+            })
+            .is_none());
+    }
+
+    #[test]
+    fn full_inline_image_keys_give_the_data_length() {
+        let mut image_data = vec![0; 24];
+        image_data[1..3].copy_from_slice(b"EI");
+        let mut data =
+            b"BI /Width 24 /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceGray ID ".to_vec();
+        data.extend_from_slice(&image_data);
+        data.extend_from_slice(b"EI q");
+
+        let mut tokenizer = UntypedIter::new(&data);
+        let instruction = tokenizer.next().expect("inline image instruction");
+        assert_eq!(instruction.operator.as_ref(), b"BI");
+        let stream = instruction
+            .operands()
+            .find_map(|operand| match operand {
+                Object::Stream(stream) => Some(stream),
+                _ => None,
+            })
+            .expect("inline image stream operand");
+        assert_eq!(stream.raw_data().as_ref(), image_data.as_slice());
+    }
+
+    #[test]
+    fn image_mask_without_bits_per_component_uses_one_bit() {
+        let data = b"BI /W 32 /H 1 /IM true ID \x00EI\x00 EI q";
+        let mut tokenizer = UntypedIter::new(data);
+        let instruction = tokenizer.next().expect("inline image instruction");
+        assert_eq!(instruction.operator.as_ref(), b"BI");
+        let stream = instruction
+            .operands()
+            .find_map(|operand| match operand {
+                Object::Stream(stream) => Some(stream),
+                _ => None,
+            })
+            .expect("inline image stream operand");
+        assert_eq!(stream.raw_data().as_ref(), b"\x00EI\x00");
+    }
+
+    #[test]
+    fn declared_length_ends_a_filtered_inline_image() {
+        // The ASCII85-encoded data contains "EI" followed by whitespace, which the
+        // heuristics would take for the end; /L states the encoded length outright.
+        let data = b"BI /W 2 /H 1 /CS /G /F /ASCII85Decode /L 8 ID aEIbbbbb EI q";
+        let mut tokenizer = UntypedIter::new(data);
+        let instruction = tokenizer.next().expect("inline image instruction");
+        assert_eq!(instruction.operator.as_ref(), b"BI");
+        let stream = instruction
+            .operands()
+            .find_map(|operand| match operand {
+                Object::Stream(stream) => Some(stream),
+                _ => None,
+            })
+            .expect("inline image stream operand");
+        assert_eq!(stream.raw_data().as_ref(), b"aEIbbbbb");
+    }
 }
 
-/// PdfCraft patch: the exact byte length of an inline image's data, when the image is
-/// uncompressed and its dimensions, bit depth and component count are known. `None` when any
-/// of those is missing or a filter makes the encoded length unknowable. Rows are padded to
-/// whole bytes (ISO 32000-2 §8.9.7.2).
+/// PdfCraft patch: the exact byte length of an inline image's data, when it can be known from
+/// the dictionary. A `/L` (or `/Length`) states it outright, filtered or not (ISO 32000-2:2020,
+/// Table 91); otherwise the image must be uncompressed with known dimensions, bit depth and
+/// component count. `None` when none of that is known. Rows are padded to whole bytes
+/// (ISO 32000-2 §8.9.7.2).
 fn inline_data_len(dict: &object::Dict<'_>) -> Option<usize> {
-    if dict.get::<Object<'_>>(b"F").is_some()
-        || dict.get::<Object<'_>>(b"Filter").is_some()
-    {
+    if let Some(len) = dict.get::<u32>(b"L").or_else(|| dict.get::<u32>(b"Length")) {
+        return (len > 0).then_some(len as usize);
+    }
+    if dict.get::<Object<'_>>(b"F").is_some() || dict.get::<Object<'_>>(b"Filter").is_some() {
         return None;
     }
-    let width = dict.get::<u32>(b"W")? as usize;
-    let height = dict.get::<u32>(b"H")? as usize;
-    let bpc = dict.get::<u8>(b"BPC")? as usize;
+    let width = dict
+        .get::<u32>(b"W")
+        .or_else(|| dict.get::<u32>(b"Width"))? as usize;
+    let height = dict
+        .get::<u32>(b"H")
+        .or_else(|| dict.get::<u32>(b"Height"))? as usize;
+    let image_mask = dict.get::<bool>(b"IM").unwrap_or(false)
+        || dict.get::<bool>(b"ImageMask").unwrap_or(false);
+    // An image mask's BitsPerComponent is optional and defaults to 1 (Table 87); any other
+    // value with an image mask is malformed and falls back to the heuristics.
+    let bpc = match dict
+        .get::<u8>(b"BPC")
+        .or_else(|| dict.get::<u8>(b"BitsPerComponent"))
+    {
+        Some(bpc) if !image_mask || bpc == 1 => bpc as usize,
+        None if image_mask => 1,
+        _ => return None,
+    };
     if width == 0 || height == 0 || bpc == 0 || bpc > 16 {
         return None;
     }
-    let components = if dict.get::<bool>(b"IM").unwrap_or(false) {
+    let components = if image_mask {
         1
     } else {
-        match dict.get::<Name<'_>>(b"CS")?.deref() {
+        let cs = dict
+            .get::<Name<'_>>(b"CS")
+            .or_else(|| dict.get::<Name<'_>>(b"ColorSpace"))?;
+        match cs.deref() {
             b"G" | b"DeviceGray" => 1,
             b"RGB" | b"DeviceRGB" => 3,
             b"CMYK" | b"DeviceCMYK" => 4,

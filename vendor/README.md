@@ -9,7 +9,7 @@ A PdfCraft patch in `hayro-syntax::Page::base_dimensions` expresses the existing
 
 In `hayro-interpret`, Type 3 glyph bounding boxes are transformed to device space before intersecting clip and shading bounds; `raster::tests::shaded_type3_glyph_draws_at_multiple_positions` covers translated glyphs (#3178).
 
-The `hayro-syntax` inline-image boundary calculation treats both `/F` and `/Filter` as filters, uses checked arithmetic, and has synthetic regressions for embedded `EI` bytes and filtered-image lengths.
+The `hayro-syntax` inline-image parser ends an inline image at the data length its dictionary states — a `/L`, or the computed length of an uncompressed image from its dimensions, bit depth and component count (full key names and image-mask defaults included) — and treats both `/F` and `/Filter` as filters otherwise. The arithmetic is checked, and synthetic regressions cover embedded `EI` bytes, filtered images and the full key names.
 
 | Crate | Version | Licence | Patches | Test |
 |---|---|---|---|---|
